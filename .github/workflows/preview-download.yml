@@ -71,6 +71,25 @@ jobs:
               print('Verified newest preview:', latest['tag_name'], digest, len(data))
               raise SystemExit(0)
 
+          # Empty release bodies fall back to annotated-tag text on GitHub.
+          # Keep this owned mutable alias lightweight so notes also look blank.
+          try:
+              ref = api('/git/ref/tags/' + alias_tag)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              commit = api('/git/ref/heads/main')['object']['sha']
+              api('/git/refs', 'POST', {'ref': 'refs/tags/' + alias_tag, 'sha': commit})
+          else:
+              target = ref['object']
+              for _ in range(8):
+                  if target['type'] != 'tag':
+                      break
+                  target = api('/git/tags/' + target['sha'])['object']
+              assert target['type'] == 'commit', 'Alias must resolve to a commit'
+              if ref['object']['type'] == 'tag':
+                  api('/git/refs/tags/' + alias_tag, 'PATCH', {'sha': target['sha'], 'force': True})
+
           alias = next((r for r in releases if r['tag_name'] == alias_tag), None)
           if alias is None:
               alias = api('/releases', 'POST', {'tag_name': alias_tag, 'target_commitish': 'main',
