@@ -1,0 +1,99 @@
+name: Update preview download
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/preview-download.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iidx33-preview-download
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.event_name != 'release' || github.event.release.tag_name != 'iidx33-preview-latest'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mirror the latest published IIDX 33 preview ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, urllib.error, urllib.parse, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          assert repo == 'cyl0/point-zero-updates'
+          base = 'https://api.github.com/repos/' + repo
+          alias_tag = 'iidx33-preview-latest'
+          headers = {'Accept': 'application/vnd.github+json',
+                     'User-Agent': 'point-zero-preview-download'}
+          if os.environ.get('GH_TOKEN'):
+              headers['Authorization'] = 'Bearer ' + os.environ['GH_TOKEN']
+
+          def api(path, method='GET', value=None, binary=False):
+              url = path if path.startswith('https://uploads.github.com/') else base + path
+              body = value if binary else json.dumps(value).encode() if value is not None else None
+              request_headers = dict(headers)
+              request_headers['Content-Type'] = 'application/zip' if binary else 'application/json'
+              request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  raw = response.read()
+              return json.loads(raw) if raw else None
+
+          releases = []
+          page = 1
+          while True:
+              rows = api('/releases?per_page=100&page=' + str(page))
+              releases.extend(rows)
+              if len(rows) < 100:
+                  break
+              page += 1
+          candidates = [r for r in releases if not r['draft'] and r['prerelease']
+                        and re.match(r'^v?33\.', r['tag_name']) and r.get('published_at')]
+          if not candidates:
+              raise SystemExit('No published IIDX 33 preview release')
+          latest = max(candidates, key=lambda r: (r['published_at'], r['id']))
+          assets = [a for a in latest['assets'] if a['name'] == 'point-zero.zip' and a['state'] == 'uploaded']
+          assert len(assets) == 1, 'Newest preview must have exactly one ready ZIP'
+          source = assets[0]
+          digest = source.get('digest')
+          assert digest and digest.startswith('sha256:'), 'Missing GitHub asset checksum'
+          with urllib.request.urlopen(source['browser_download_url'], timeout=90) as response:
+              data = response.read()
+          assert len(data) == source['size'] and 'sha256:' + hashlib.sha256(data).hexdigest() == digest
+          if os.environ.get('PREVIEW_DRY_RUN') == '1':
+              print('Verified newest preview:', latest['tag_name'], digest, len(data))
+              raise SystemExit(0)
+
+          alias = next((r for r in releases if r['tag_name'] == alias_tag), None)
+          if alias is None:
+              alias = api('/releases', 'POST', {'tag_name': alias_tag, 'target_commitish': 'main',
+                          'name': 'Latest IIDX 33 preview', 'body': '', 'draft': False,
+                          'prerelease': True, 'make_latest': 'false'})
+          assert not alias['draft'] and alias['prerelease']
+          assert alias['body'] in ('', None)
+          current = [a for a in alias['assets'] if a['name'] == 'point-zero.zip']
+          if len(current) == 1 and current[0].get('digest') == digest and current[0]['size'] == len(data):
+              print('Preview alias already current:', latest['tag_name'])
+              raise SystemExit(0)
+          assert len(current) <= 1
+          staged_name = 'point-zero-next-' + str(latest['id']) + '.zip'
+          staged = next((a for a in alias['assets'] if a['name'] == staged_name), None)
+          if staged:
+              assert staged.get('digest') == digest and staged['size'] == len(data)
+          else:
+              upload = alias['upload_url'].split('{', 1)[0] + '?name=' + urllib.parse.quote(staged_name)
+              staged = api(upload, 'POST', data, binary=True)
+              assert staged.get('digest') == digest and staged['size'] == len(data)
+          if current:
+              api('/releases/assets/' + str(current[0]['id']), 'DELETE')
+          ready = api('/releases/assets/' + str(staged['id']), 'PATCH', {'name': 'point-zero.zip'})
+          assert ready.get('digest') == digest and ready['name'] == 'point-zero.zip'
+          print('Updated direct preview download to', latest['tag_name'], digest)
+          PY
